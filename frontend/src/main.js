@@ -21,6 +21,7 @@ import { refreshFrustums } from './viz/debugViz.js';
 import { loadCar } from './viz/loadCar.js';
 import { JOINT_ORDER } from './config/jointMeta.js';
 import { getPose, matrixToPose, computeRelativePose } from './utils/poseUtils.js';
+import { RLAgent } from './control/rlAgent.js';
 
 // 소켓 생성 (그냥 전역 노출함)
 const socket = new SocketClient('ws://localhost:3101');
@@ -36,9 +37,17 @@ const setFocus = (next) => {
 };
 
 // RL 액션 수신 → 로봇에 적용
+// RL 액션 수신 → RLAgent 또는 기존 컨트롤러에 적용
 socket.on('rl-action', (data) => {
   console.log('[WS] rl-action received:', data);
-  controller.applyRLAction(data);
+  // Node 쪽에서 { action: [ax, ay, az] } 형태로 보내준 경우 RLAgent 사용
+  if (rlAgent && Array.isArray(data?.action)) {
+    rlAgent.handleAction(data.action);
+  }
+  // 예전 방식(RPY / 조인트 델타)을 쓰는 경우는 그대로 유지
+  else if (controller?.applyRLAction) {
+    controller.applyRLAction(data);
+  }
 });
 socket.on('vision-result', (data) => {
   if (!data) return;
@@ -101,15 +110,20 @@ let detectStreaming = false;
 let detectTimer = null;
 
 let frustumState = { left: null, right: null };
-let targetAxes = null;
-let tcpAxes = null;
+let targetAxes = null; // 10cm 앞 중간 목표
+let tcpAxes = null;    // TCP(플러그 팁) 좌표축
+let goalAxes = null;   // 최종 목표(소켓 입구) 좌표축
+let rlAgent = null;
+let rlPending = false;
 
 const { scene, camera, renderer, controls, dir } = createScene();
-// IK 타깃 및 TCP(플러그 팁) 좌표축 시각화용 헬퍼
-targetAxes = new THREE.AxesHelper(0.1); // 타깃 좌표축 (X:빨강, Y:초록, Z:파랑)
+// IK 타깃 및 TCP(플러그 팁), 최종 목표 좌표축 시각화용 헬퍼
+targetAxes = new THREE.AxesHelper(0.1); // 10cm 앞 중간 목표 좌표축 (X:빨강, Y:초록, Z:파랑)
 tcpAxes = new THREE.AxesHelper(0.1);    // TCP(빨간 점) 좌표축
+goalAxes = new THREE.AxesHelper(0.12);  // 최종 목표(소켓 입구) 좌표축
 scene.add(targetAxes);
 scene.add(tcpAxes);
+scene.add(goalAxes);
 
 const hud = new HUD();
 const {
@@ -151,6 +165,9 @@ robotLoadPromise.then(({ plugFrame: pf, stereo: st, plugMarker: pm, plugCam: pc 
   stereo = st;
   plugMarker = pm;
   plugCam = pc || null;
+
+  // RLAgent는 plugFrame(TCP 프레임)이 준비된 뒤에 생성
+  rlAgent = new RLAgent({ controller, input, plugFrame });
 });
 
 // 충전 포트 로드 (모듈화)
@@ -298,6 +315,27 @@ function toggleDetectStreaming() {
   }
 }
 
+// RL 서버(FastAPI)로 TCP->Socket 상대 위치를 보내고 액션을 받아오는 헬퍼
+async function requestRLActionFromServer(pos) {
+  try {
+    const res = await fetch('http://localhost:8000/predict', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        pos: [pos.x, pos.y, pos.z],
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`RL server HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    return data.action; // [ax, ay, az]
+  } catch (err) {
+    console.error('[RL] requestRLActionFromServer error:', err);
+    return null;
+  }
+}
+
 // 디버그 프러스텀 생성 함수
 // 메인 루프
 const clock = new THREE.Clock();
@@ -354,24 +392,59 @@ function tick() {
     let target = null;
 
     if (portFrame) {
-      // 🔹 PortFrame의 위치 + 방향을 그대로 목표 포즈로 사용
-      const targetPose = new THREE.Object3D();
-      portFrame.getWorldPosition(targetPose.position);
-      portFrame.getWorldQuaternion(targetPose.quaternion);
+      // 🔹 PortFrame의 위치 + 방향을 그대로 기준 포즈로 사용
+      const socketPos = new THREE.Vector3();
+      const socketQuat = new THREE.Quaternion();
+      portFrame.getWorldPosition(socketPos);
+      portFrame.getWorldQuaternion(socketQuat);
 
       // 소켓 축에 대해 추가 회전(예: Z축으로 90도 회전)
-      const eulerOffset = new THREE.Euler(-Math.PI/2, 0, 0); // roll/pitch/yaw 단위
+      const eulerOffset = new THREE.Euler(-Math.PI / 2, 0, 0); // roll/pitch/yaw 단위
       const qOffset = new THREE.Quaternion().setFromEuler(eulerOffset);
 
-      // target = socketRot * offsetRot
-      targetPose.quaternion.multiply(qOffset);
+      // 최종 목표 방향 = socketRot * offsetRot
+      const goalQuat = socketQuat.clone().multiply(qOffset);
 
-      // (선택) 살짝 떨어진 위치에서 멈추고 싶으면:
-      const offset = new THREE.Vector3(0, 0, 0.1);   // 소켓 로컬 -Z 방향으로 10cm
-      offset.applyQuaternion(targetPose.quaternion);
-      targetPose.position.add(offset);
+      // ✅ 최종 목표(소켓 입구) 좌표축 갱신
+      if (goalAxes) {
+        goalAxes.position.copy(socketPos);
+        goalAxes.quaternion.copy(goalQuat);
+      }
 
-      // IK 타깃 좌표축을 타깃 포즈에 맞게 갱신
+      // ---------------------------------------------
+      // 1차 목표(10cm 앞): 포트 노말 방향으로 "수직" 접근
+      //   - Z축: 포트 노말 방향 (goalQuat의 전진 방향)
+      //   - Y축: 되도록 월드 업(0,1,0)과 가깝게
+      //   → 손목이 눕지 않고 수직으로 들어가는 느낌을 줌
+      // ---------------------------------------------
+      const forward = new THREE.Vector3(0, 0, 1).applyQuaternion(goalQuat).normalize(); // 소켓 노말
+      const worldUp = new THREE.Vector3(0, 1, 0);
+
+      // forward와 worldUp이 거의 평행인 경우를 피하기 위한 보정
+      let right = new THREE.Vector3().crossVectors(worldUp, forward);
+      if (right.lengthSq() < 1e-6) {
+        // worldUp 대신 X축을 사용
+        right = new THREE.Vector3(1, 0, 0).cross(forward);
+      }
+      right.normalize();
+      const up = new THREE.Vector3().crossVectors(forward, right).normalize();
+ 
+      const basisMat = new THREE.Matrix4();
+      // makeBasis(x, y, z) 순서
+      basisMat.makeBasis(right, up, forward);
+      const approachQuat = new THREE.Quaternion().setFromRotationMatrix(basisMat);
+
+      // ✅ 10cm 앞 중간 목표 포즈 계산 (수직 접근 자세 사용)
+      const targetPose = new THREE.Object3D();
+      const targetPos = socketPos.clone();
+      const offset = new THREE.Vector3(0, 0, 0.1); // 소켓 로컬 -Z 방향으로 10cm
+      offset.applyQuaternion(goalQuat); // 위치는 최종 목표 노말 기준으로 오프셋
+      targetPos.add(offset);
+
+      targetPose.position.copy(targetPos);
+      targetPose.quaternion.copy(approachQuat); // 1차 목표에서는 수직 접근 자세 사용
+
+      // IK 타깃 좌표축을 중간 목표 포즈에 맞게 갱신
       if (targetAxes) {
         targetAxes.position.copy(targetPose.position);
         targetAxes.quaternion.copy(targetPose.quaternion);
@@ -420,6 +493,31 @@ function tick() {
     const relMat = plugFrame.matrixWorld.clone().invert().multiply(portFrame.matrixWorld);
     relPose = matrixToPose(relMat);
   }
+
+  // IK → RL 전환 및 RL 액션 적용
+  if (rlAgent && relPose && relPose.position) {
+    // 1) 현재 상대 포즈 기반으로 IK 단계가 끝났는지 체크
+    rlAgent.updatePhase({ relPose });
+
+    // 2) RL 모드일 때만 FastAPI로 상태 보내고 액션 받아오기
+    if (rlAgent.mode === 'RL' && !rlPending) {
+      const p = relPose.position;
+      rlPending = true;
+      requestRLActionFromServer(p)
+        .then((action) => {
+          if (action && rlAgent) {
+            rlAgent.handleAction(action);
+          }
+        })
+        .catch((err) => {
+          console.error('[RL] predict error:', err);
+        })
+        .finally(() => {
+          rlPending = false;
+        });
+    }
+  }
+
   if (lastKeyAction) hud.setExtra(lastKeyAction);
   hud.updateWithPoses({
     robot,

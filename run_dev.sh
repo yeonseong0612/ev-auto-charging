@@ -13,7 +13,7 @@ PIDS=()
 
 start_rl() {
   (
-    cd "$ROOT_DIR/control"   # RL 디렉토리 이름이 control인 것을 가정
+    cd "$ROOT_DIR/control/RL"   # PPO 삽입 정책 인퍼런스 서버 위치
     # conda 환경 활성화 (설치 경로/환경명은 CONDA_SH, CONDA_ENV로 오버라이드 가능)
     if [ -f "$CONDA_SH" ]; then
       # shellcheck source=/dev/null
@@ -24,7 +24,8 @@ start_rl() {
     fi
 
     conda activate "$CONDA_ENV"
-    python -m uvicorn main:app --reload --port 8000
+    # arm_insert_infer_server.py 내부에서 uvicorn을 직접 실행
+    python arm_insert_infer_server.py
   ) &
   PIDS+=($!)
 }
